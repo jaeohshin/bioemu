@@ -20,17 +20,12 @@ from bioemu.hpacker_setup.setup_hpacker import (
     ensure_hpacker_install,
 )
 from bioemu.md_utils import get_propka_protonation
+from bioemu.utils import get_conda_prefix
 
 logger = logging.getLogger(__name__)
 
 HPACKER_ENVNAME = os.getenv("HPACKER_ENV_NAME", HPACKER_DEFAULT_ENVNAME)
 HPACKER_REPO_DIR = os.getenv("HPACKER_REPO_DIR", HPACKER_DEFAULT_REPO_DIR)
-HPACKER_PYTHONBIN = os.path.join(
-    os.path.abspath(os.path.join(os.environ["CONDA_PREFIX"], "..")),
-    HPACKER_ENVNAME,
-    "bin",
-    "python",
-)
 
 
 class MDProtocol(str, Enum):
@@ -43,9 +38,18 @@ def _run_hpacker(protein_pdb_in: str, protein_pdb_out: str) -> None:
     # make sure that hpacker env is set up
     ensure_hpacker_install(envname=HPACKER_ENVNAME, repo_dir=HPACKER_REPO_DIR)
 
+    _default_hpacker_pythonbin = os.path.join(
+        get_conda_prefix(),
+        "envs",
+        HPACKER_ENVNAME,
+        "bin",
+        "python",
+    )
+    hpacker_pythonbin = os.getenv("HPACKER_PYTHONBIN", _default_hpacker_pythonbin)
+
     result = subprocess.run(
         [
-            HPACKER_PYTHONBIN,
+            hpacker_pythonbin,
             os.path.abspath(os.path.join(os.path.dirname(__file__), "run_hpacker.py")),
             protein_pdb_in,
             protein_pdb_out,
@@ -164,6 +168,9 @@ def run_one_md(
 def run_all_md(samples_all: list[mdtraj.Trajectory], md_protocol: MDProtocol) -> mdtraj.Trajectory:
     """run MD for set of protonated samples.
 
+    This function will skip samples that cannot be loaded by openMM default setup generator,
+    i.e. it might output fewer frames than in input.
+
     Args:
         samples_all: mdtraj objects with protonated samples (can be different protonation states)
         md_protocol: md protocol
@@ -172,17 +179,27 @@ def run_all_md(samples_all: list[mdtraj.Trajectory], md_protocol: MDProtocol) ->
         array containing all heavy-atom coordinates
     """
 
-    equil_xyz = np.empty(
-        (len(samples_all), samples_all[0].top.select("protein and mass > 2").shape[0], 3)
-    )
+    equil_xyz = []
 
     for n, frame in tqdm(enumerate(samples_all), leave=False, desc="running MD equilibration"):
         atom_idx = frame.top.select("protein and mass > 2")
-        positions = run_one_md(
-            frame, only_energy_minimization=md_protocol == MDProtocol.LOCAL_MINIMIZATION
+        try:
+            positions = run_one_md(
+                frame, only_energy_minimization=md_protocol == MDProtocol.LOCAL_MINIMIZATION
+            )
+            equil_xyz.append(positions[atom_idx])
+        except ValueError as err:
+            logger.warning(f"Skipping sample {n} for MD setup: Failed with\n {err}")
+
+    if not equil_xyz:
+        raise RuntimeError(
+            "Could not create MD setups for given system. Try running MD setup on reconstructed samples manually."
         )
-        equil_xyz[n] = positions[atom_idx]
-    equil_traj = mdtraj.Trajectory(equil_xyz, samples_all[-1].top.subset(atom_idx))
+
+    equil_traj = mdtraj.Trajectory(
+        np.concatenate([xyz[np.newaxis, ...] for xyz in equil_xyz], axis=0),
+        samples_all[-1].top.subset(atom_idx),
+    )
     return equil_traj
 
 
@@ -212,8 +229,8 @@ def main(
     samples_all_heavy = reconstruct_sidechains(samples)
 
     # write out sidechain reconstructed output
-    samples_all_heavy.save_xtc(f"{prefix}_sidechain_rec.xtc")
-    samples_all_heavy[0].save_pdb(f"{prefix}_sidechain_rec.pdb")
+    samples_all_heavy.save_xtc(os.path.join(outpath, f"{prefix}_sidechain_rec.xtc"))
+    samples_all_heavy[0].save_pdb(os.path.join(outpath, f"{prefix}_sidechain_rec.pdb"))
 
     # run MD equilibration if requested
     if md_equil:
